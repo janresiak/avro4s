@@ -2,15 +2,18 @@ package com.sksamuel.avro4s
 
 import com.sksamuel.avro4s.SchemaUpdate.{FullSchemaUpdate, NamespaceUpdate, NoUpdate}
 import magnolia.{CaseClass, Param}
+import org.apache.avro.LogicalTypes.Decimal
 import org.apache.avro.Schema.Field
 import org.apache.avro.generic.IndexedRecord
 
+import scala.collection.JavaConverters._
 import scala.util.control.NonFatal
 import org.apache.avro.{Schema, SchemaBuilder}
 
 object RecordFields {
 
   class FieldEncoder[T](val param: Param[Encoder, T]) extends Serializable {
+
     // using inner class here to be able to reference param.PType below, and keep the type relation intact in
     // the apply() method below.
     class ValueEncoder(encoder: Encoder[param.PType], val fieldName: String) extends Serializable {
@@ -49,20 +52,21 @@ object RecordFields {
   }
 
   class FieldDecoder[T](val param: Param[Decoder, T]) extends Serializable {
+
     // using inner class here to be able to reference param.PType below, and keep the type relation intact in
     // the apply() method below.
     class ValueDecoder(decoder: Decoder[param.PType], val fieldName: Option[String], fieldPosition: Int)
-        extends Serializable {
+      extends Serializable {
 
       def fastDecodeFieldValue(record: IndexedRecord): Any =
         if (fieldPosition == -1) defaultFieldValue
-        else tryDecode(record.get(fieldPosition))
+        else tryDecode(record.get(fieldPosition), None)
 
       def safeDecodeFieldValue(record: IndexedRecord): Any =
         if (fieldPosition == -1) defaultFieldValue
         else {
           val schemaField = record.getSchema.getField(fieldName.get)
-          if (schemaField == null) defaultFieldValue else tryDecode(record.get(schemaField.pos))
+          if (schemaField == null) defaultFieldValue else tryDecode(record.get(schemaField.pos), Option(schemaField.schema))
         }
 
       @inline
@@ -73,12 +77,35 @@ object RecordFields {
       }
 
       @inline
-      private def tryDecode(value: Any): Any =
+      private def tryDecode(value: Any, schema: Option[Schema]): Any = {
+        def isOption(schema: Schema) = {
+          schema.isUnion && schema.isNullable && Option(schema.getTypes).map(_.asScala).toList.flatten.count(!_.isNullable) == 1
+        }
+
+        def isDecimal(schema: Schema) = {
+          Option(schema.getLogicalType).exists(_.isInstanceOf[Decimal])
+        }
+
         try {
-          decoder.decode(value)
+          if (value == null || !Option(param.default).flatten.isInstanceOf[Option[BigDecimal]]) {
+            return decoder.decode(value)
+          }
+          Option(schema).flatten match {
+            case Some(s) if isDecimal(s) =>
+              val lt = s.getLogicalType.asInstanceOf[Decimal]
+              implicit val sp: ScalePrecision = ScalePrecision(lt.getScale, lt.getPrecision)
+              Decoder[BigDecimal].decode(value)
+            case Some(s) if isOption(s) && Option(s.getTypes).map(_.asScala).toList.flatten.exists(isDecimal) =>
+              val lt = s.getTypes.asScala.find(!_.isNullable).get.getLogicalType.asInstanceOf[Decimal]
+              implicit val sp: ScalePrecision = ScalePrecision(lt.getScale, lt.getPrecision)
+              Decoder[Option[BigDecimal]].decode(value)
+            case _ =>
+              decoder.decode(value)
+          }
         } catch {
           case NonFatal(ex) => param.default.getOrElse(throw ex)
         }
+      }
     }
 
     // using the apply method here to create a ValueDecoder while keeping the types consistent and making sure to
@@ -139,7 +166,7 @@ object RecordFields {
         val ns = namespace.getOrElse(record.getNamespace)
         FullSchemaUpdate(SchemaFor(SchemaBuilder.fixed(name).namespace(ns).size(size), fieldMapper))
       case (_, Some(ns)) => NamespaceUpdate(ns)
-      case _             => NoUpdate
+      case _ => NoUpdate
     }
   }
 
